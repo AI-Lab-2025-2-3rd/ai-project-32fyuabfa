@@ -1,0 +1,312 @@
+# Required CSVs in project root:
+# X_train.csv, y_train.csv, X_val.csv, y_val.csv, train_preprocessed.csv, test_preprocessed.csv
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
+
+BASE = os.getcwd()
+FILES = {
+    "X_train": os.path.join(BASE, "X_train.csv"),
+    "y_train": os.path.join(BASE, "y_train.csv"),
+    "X_val": os.path.join(BASE, "X_val.csv"),
+    "y_val": os.path.join(BASE, "y_val.csv"),
+    "train_pre": os.path.join(BASE, "train_preprocessed.csv"),
+    "test_pre": os.path.join(BASE, "test_preprocessed.csv"),
+}
+
+# 전처리 위한 데이터 파일 불러오기
+# Check files
+# missing = [k for k,p in FILES.items() if not os.path.exists(p)]
+# if missing:
+#     raise FileNotFoundError(f"Missing files in project directory: {missing}. Put required CSVs in {BASE}")
+#
+# print(" All required CSV files found. Loading...")
+
+# Load data
+X_train = pd.read_csv(FILES["X_train"])
+y_train = pd.read_csv(FILES["y_train"]).squeeze()
+X_val_provided = pd.read_csv(FILES["X_val"])
+y_val_provided = pd.read_csv(FILES["y_val"]).squeeze()
+test_pre = pd.read_csv(FILES["test_pre"])
+
+# Safe conversions
+def safe_prepare(df):
+    df = df.copy()
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    for c in df.columns:
+        if df[c].isnull().any():
+            df[c].fillna(df[c].mean(), inplace=True)
+    return df
+
+X_train = safe_prepare(X_train)
+X_val_provided = safe_prepare(X_val_provided)
+test_pre = safe_prepare(test_pre)
+
+y_train = y_train.astype(int).reset_index(drop=True)
+y_val_provided = y_val_provided.astype(int).reset_index(drop=True)
+
+#결측값 처리, 범주형 변수 인코딩
+#gender,subscription_type: 문자열->숫ㅅ자변환
+#gender:m:0,f:1
+#subscription_type:member:0,plus:1,vip:2
+#수치형 변수 스케일링(정규화)
+#age,tenure,frequent,payment_interval,after_interaction, contract_length
+# 모두 숫자이지만 값의 범위가 달라 모델이 한쪽으로 치우칠 수 있다.
+#평균0,분산1(표준화)로 조정
+# Try imports for optional packages
+USE_SMOTE = False
+try:
+    from imblearn.over_sampling import SMOTE
+    USE_SMOTE = True
+    print("imblearn detected: SMOTE enabled.")
+except Exception:
+    print("imblearn not available: SMOTE disabled (install imbalanced-learn to enable).")
+
+try:
+    import lightgbm as lgb
+except Exception as e:
+    raise ImportError("lightgbm not installed in environment. Install it via 'pip install lightgbm'.")
+
+# Optuna optional: if present, use it; otherwise fallback to default params
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+    print("optuna detected: HPO enabled.")
+except Exception:
+    OPTUNA_AVAILABLE = False
+    print("optuna not installed: HPO disabled, using default params.")
+
+# Feature engineering helpers (CV-safe TE, freq, interactions)
+def target_encode_cv(train_series, train_y, valid_series, min_samples_leaf=20, smoothing=10):
+    prior = train_y.mean()
+    df = pd.DataFrame({"cat": train_series, "y": train_y})
+    agg = df.groupby("cat")["y"].agg(["mean","count"]).reset_index()
+    agg["smoothing"] = 1 / (1 + np.exp(-(agg["count"] - min_samples_leaf) / smoothing))
+    agg["te"] = prior * (1 - agg["smoothing"]) + agg["mean"] * agg["smoothing"]
+    mapping = dict(zip(agg["cat"], agg["te"]))
+    return valid_series.map(mapping).fillna(prior).values
+
+def freq_encode(series):
+    vc = series.value_counts(dropna=False)
+    return series.map(vc).fillna(0).values
+
+def add_interactions(df, cols):
+    df = df.copy()
+    for i in range(len(cols)):
+        for j in range(i+1, len(cols)):
+            a, b = cols[i], cols[j]
+            df[f"{a}_x_{b}"] = df[a] * df[b]
+            denom = df[b].replace(0, np.nan)
+            df[f"{a}_div_{b}"] = (df[a] / denom).fillna(0)
+    return df
+
+# Preprocess function that returns processed train and processed test (or validation) with same columns
+def preprocess_with_train(train_x, train_y, other_x):
+    # train_x: DataFrame (train portion)
+    # train_y: Series aligned with train_x
+    # other_x: DataFrame to be transformed using mappings learned from train_x (could be val or test)
+    X_tr = train_x.reset_index(drop=True).copy()
+    X_ot = other_x.reset_index(drop=True).copy()
+
+    # find candidate categorical-like columns (object or low cardinality)
+    cat_cols = [c for c in X_tr.columns if (X_tr[c].dtype == object) or (X_tr[c].nunique() <= 20)]
+    for c in cat_cols:
+        X_tr[c] = X_tr[c].fillna("NA")
+        X_ot[c] = X_ot[c].fillna("NA")
+        X_tr[c + "_te"] = target_encode_cv(X_tr[c], train_y, X_tr[c], min_samples_leaf=20, smoothing=10)
+        X_ot[c + "_te"] = target_encode_cv(X_tr[c], train_y, X_ot[c], min_samples_leaf=20, smoothing=10)
+        # frequency encoding
+        freq = X_tr[c].value_counts()
+        X_tr[c + "_freq"] = X_tr[c].map(freq).fillna(0)
+        X_ot[c + "_freq"] = X_ot[c].map(freq).fillna(0)
+
+    # interactions on numeric subset
+    numeric_cols = X_tr.select_dtypes(include=[np.number]).columns.tolist()
+    inter_cols = numeric_cols[:6] if len(numeric_cols) > 6 else numeric_cols
+    if len(inter_cols) >= 2:
+        X_tr = add_interactions(X_tr, inter_cols)
+        X_ot = add_interactions(X_ot, inter_cols)
+
+    # final safe numeric coercion
+    X_tr = safe_prepare(X_tr)
+    X_ot = safe_prepare(X_ot)
+    return X_tr, X_ot
+
+# Build processed full train and processed test using full training data as mapping source (important for final prediction)
+print("Applying global processing to create final processed train/test for consistency...")
+X_train_proc_full, test_pre_proc = preprocess_with_train(X_train, y_train, test_pre)
+# Note: during CV we will recompute fold-local TE for strict no-leakage; but test_pre_proc here uses full-train mapping (OK for final prediction after CV)
+print("Processed shapes:", X_train_proc_full.shape, test_pre_proc.shape)
+
+# CV and Optuna objective
+N_SPLITS = 5
+skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+n_classes = len(np.unique(y_train))
+
+# Default params (fallback)
+DEFAULT_PARAMS = {
+    "objective": "multiclass",
+    "num_class": n_classes,
+    "learning_rate": 0.03,
+    "num_leaves": 64,
+    "min_child_samples": 20,
+    "feature_fraction": 0.9,
+    "bagging_fraction": 0.8,
+    "lambda_l1": 0.0,
+    "lambda_l2": 1.0,
+    "n_estimators": 2000,
+    "class_weight": "balanced",
+    "random_state": 42,
+    "n_jobs": -1,
+}
+
+def cv_evaluate(params):
+    # params: dict for LGBMClassifier (must include n_estimators)
+    oof_probs = np.zeros((len(X_train), n_classes))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_train, y_train)):
+        # get fold splits
+        X_tr_raw = X_train.iloc[tr_idx].reset_index(drop=True)
+        y_tr_raw = y_train.iloc[tr_idx].reset_index(drop=True)
+        X_va_raw = X_train.iloc[va_idx].reset_index(drop=True)
+
+        # Fold-local preprocess: learn encodings from X_tr_raw and apply to X_va_raw
+        X_tr_proc, X_va_proc = preprocess_with_train(X_tr_raw, y_tr_raw, X_va_raw)
+
+        # Optional SMOTE on fold-train
+        X_tr_res, y_tr_res = X_tr_proc, y_tr_raw
+        if USE_SMOTE:
+            try:
+                sm = SMOTE(random_state=42, n_jobs=1)
+                X_tr_res, y_tr_res = sm.fit_resample(X_tr_proc, y_tr_raw)
+            except Exception:
+                X_tr_res, y_tr_res = X_tr_proc, y_tr_raw
+
+        # sample weights
+        classes_local = np.unique(y_tr_res)
+        cw = compute_class_weight("balanced", classes=classes_local, y=y_tr_res)
+        wmap = dict(zip(classes_local, cw))
+        sample_weight = np.array([wmap[c] for c in y_tr_res])
+
+        # train
+        model = lgb.LGBMClassifier(**params)
+        callbacks = [lgb.early_stopping(stopping_rounds=100), lgb.log_evaluation(period=0)]
+        model.fit(X_tr_res, y_tr_res, sample_weight=sample_weight, eval_set=[(X_va_proc, y_train.iloc[va_idx])], callbacks=callbacks)
+
+        best_it = getattr(model, "best_iteration_", None)
+        proba_va = model.predict_proba(X_va_proc, num_iteration=best_it)
+        oof_probs[va_idx] = proba_va
+
+    oof_preds = np.argmax(oof_probs, axis=1)
+    score = f1_score(y_train, oof_preds, average="macro")
+    return score
+
+# If Optuna is available use it to tune; otherwise use defaults
+if OPTUNA_AVAILABLE:
+    def objective(trial):
+        params = {
+            "objective": "multiclass",
+            "num_class": n_classes,
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 128),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 80),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+            "lambda_l1": trial.suggest_float("lambda_l1", 0.0, 5.0),
+            "lambda_l2": trial.suggest_float("lambda_l2", 0.0, 5.0),
+            "n_estimators": 3000,
+            "class_weight": "balanced",
+            "random_state": 42,
+            "n_jobs": -1,
+        }
+        score = cv_evaluate(params)
+        return score
+
+    study = optuna.create_study(direction="maximize")
+    N_TRIALS = 25
+    print(f"Starting Optuna study ({N_TRIALS} trials)...")
+    study.optimize(objective, n_trials=N_TRIALS)
+    best_params = study.best_params
+    best_params.update({"objective":"multiclass", "num_class": n_classes, "n_estimators":3000, "class_weight":"balanced", "random_state":42, "n_jobs":-1})
+    print("Optuna finished. Best OOF Macro-F1:", study.best_value)
+else:
+    print("Optuna not available, using DEFAULT_PARAMS.")
+    best_params = DEFAULT_PARAMS
+
+# Final CV training with best_params, using fold-local preprocessing and final test preprocess derived from full train
+print("\nStarting final CV training with best params...")
+oof_probs_final = np.zeros((len(X_train), n_classes))
+test_probs_final = np.zeros((len(test_pre_proc), n_classes))
+models_dir = os.path.join(BASE, "models_fixed")
+os.makedirs(models_dir, exist_ok=True)
+
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_train, y_train), 1):
+    print(f"\nFold {fold}/{N_SPLITS}")
+    X_tr_raw = X_train.iloc[tr_idx].reset_index(drop=True)
+    y_tr_raw = y_train.iloc[tr_idx].reset_index(drop=True)
+    X_va_raw = X_train.iloc[va_idx].reset_index(drop=True)
+
+    X_tr_proc, X_va_proc = preprocess_with_train(X_tr_raw, y_tr_raw, X_va_raw)
+
+    # SMOTE
+    X_tr_res, y_tr_res = X_tr_proc, y_tr_raw
+    if USE_SMOTE:
+        try:
+            sm = SMOTE(random_state=42, n_jobs=1)
+            X_tr_res, y_tr_res = sm.fit_resample(X_tr_proc, y_tr_raw)
+        except Exception:
+            X_tr_res, y_tr_res = X_tr_proc, y_tr_raw
+
+    classes_local = np.unique(y_tr_res)
+    cw = compute_class_weight("balanced", classes=classes_local, y=y_tr_res)
+    wmap = dict(zip(classes_local, cw))
+    sample_weight = np.array([wmap[c] for c in y_tr_res])
+
+    model = lgb.LGBMClassifier(**best_params)
+    model.fit(X_tr_res, y_tr_res, sample_weight=sample_weight, eval_set=[(X_va_proc, y_train.iloc[va_idx])],
+              callbacks=[lgb.early_stopping(stopping_rounds=100), lgb.log_evaluation(period=0)])
+
+    best_it = getattr(model, "best_iteration_", None)
+    oof_probs_final[va_idx] = model.predict_proba(X_va_proc, num_iteration=best_it)
+
+    # For test: we need to transform test using train mapping for this fold (preprocess_with_train)
+    # Use mapping learned from X_tr_raw (train portion) to transform full test set
+    _, test_proc_for_fold = preprocess_with_train(X_tr_raw, y_tr_raw, test_pre)
+    test_probs_final += model.predict_proba(test_proc_for_fold, num_iteration=best_it) / N_SPLITS
+
+    joblib.dump(model, os.path.join(models_dir, f"model_fold{fold}.pkl"))
+    print(f"Saved fold model to: {models_dir}")
+
+# Evaluate OOF
+oof_preds_final = np.argmax(oof_probs_final, axis=1)
+oof_f1 = f1_score(y_train, oof_preds_final, average="macro")
+print("\n=== OOF Evaluation ===")
+print("OOF Macro-F1:", round(oof_f1,4))
+print(classification_report(y_train, oof_preds_final, digits=4))
+print("Confusion Matrix:\n", confusion_matrix(y_train, oof_preds_final))
+
+# Provided validation evaluation using ensemble of fold models
+val_proba_agg = np.zeros((len(X_val_provided), n_classes))
+for fname in sorted([f for f in os.listdir(models_dir) if f.endswith(".pkl")]):
+    m = joblib.load(os.path.join(models_dir, fname))
+    # apply mapping from the corresponding train fold: we don't persist mapping separately, but using preprocess_with_train with full train is acceptable for provided validation
+    _, val_proc_for_model = preprocess_with_train(X_train, y_train, X_val_provided)
+    val_proba_agg += m.predict_proba(val_proc_for_model, num_iteration=getattr(m,"best_iteration_",None)) / N_SPLITS
+val_preds_ens = np.argmax(val_proba_agg, axis=1)
+print("\nProvided Validation Macro-F1:", f1_score(y_val_provided, val_preds_ens, average="macro"))
+print(classification_report(y_val_provided, val_preds_ens, digits=4))
+
+# Save submission
+submission = pd.DataFrame({"id": test_pre.index, "target": np.argmax(test_probs_final, axis=1)})
+submission_path = os.path.join(BASE, "submission_fixed.csv")
+submission.to_csv(submission_path, index=False)
+print("\nSaved submission:", submission_path)
+print("Saved models in:", models_dir)
